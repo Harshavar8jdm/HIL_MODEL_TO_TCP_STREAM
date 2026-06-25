@@ -1,0 +1,422 @@
+/*
+ * Copyright (C) 2009 - 2019 Xilinx, Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ * 3. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+ * SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
+ * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+ * OF SUCH DAMAGE.
+ *
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "lwip/err.h"
+#include "lwip/tcp.h"
+#if defined (__arm__) || defined (__aarch64__)
+#include "xil_printf.h"
+#include "xaxidma.h"
+#include "xil_cache.h"
+#endif
+
+#define BLAST_SIZE 1460
+//#define ALLOCATED_SAMPLES 10240
+//#define ALLOCATED_SAMPLES 1000000
+#define ALLOCATED_SAMPLES 256
+#define BYTES_TO_TRANSFER  (ALLOCATED_SAMPLES * 4)
+#define BLAST_SIZE 1460 // Standard Ethernet TCP Maximum Segment Size (MSS)
+extern XAxiDma dma_instance;
+struct tcp_pcb *active_pcb = NULL; // Tracks our PC client
+extern uint32_t destination_buffer[];
+extern XAxiDma dma_instance;
+
+// State Machine Definitions
+typedef enum {
+    SYS_IDLE = 0,
+    SYS_START_DMA,
+    SYS_WAIT_DMA,
+    SYS_STREAM_TCP
+} sys_state_t;
+
+/*
+int transfer_data() {
+    // If no client is connected to our GUI/PC script, reset state and wait
+    if (active_pcb == NULL) {
+        return 0;
+    }
+
+    static sys_state_t current_state = SYS_IDLE;
+    static int tx_bytes_offset = 0;
+    int status;
+
+    switch (current_state) {
+
+        case SYS_IDLE:
+            tx_bytes_offset = 0;
+            current_state = SYS_START_DMA;
+            break;
+
+        case SYS_START_DMA:
+            // 1. Invalidate cache before launching hardware transfer
+            Xil_DCacheInvalidateRange((UINTPTR)destination_buffer, BYTES_TO_TRANSFER);
+
+            // 2. Launch Simple DMA Transfer (Non-blocking call)
+            status = XAxiDma_SimpleTransfer(&dma_instance, (UINTPTR)destination_buffer,
+                                            BYTES_TO_TRANSFER, XAXIDMA_DEVICE_TO_DMA);
+            if (status == XST_SUCCESS) {
+                current_state = SYS_WAIT_DMA;
+            }
+            break;
+
+        case SYS_WAIT_DMA:
+            // 3. Poll the hardware registers non-blockingly.
+            // If the engine is busy, immediately exit this clock cycle to let lwIP service network traffic.
+            if (!XAxiDma_Busy(&dma_instance, XAXIDMA_DEVICE_TO_DMA)) {
+                tx_bytes_offset = 0;
+                current_state = SYS_STREAM_TCP;
+            }
+            break;
+
+        /*case SYS_STREAM_TCP: {
+            int remaining_bytes = BYTES_TO_TRANSFER - tx_bytes_offset;
+
+            // If the entire 40,960-byte block has been transferred, loop back for fresh samples
+            if (remaining_bytes <= 0) {
+                current_state = SYS_START_DMA;
+                break;
+            }
+
+            // 4. Check available room in the lwIP TCP transmit window buffer
+            int available_tcp_space = tcp_sndbuf(active_pcb);
+            int chunk_size = (remaining_bytes < available_tcp_space) ? remaining_bytes : available_tcp_space;
+
+            if (chunk_size > 0) {
+                // Get pointer to current slice of data array
+                uint8_t *data_payload_ptr = (uint8_t *)destination_buffer + tx_bytes_offset;
+
+                // Write the binary chunk to the TCP transmission queue
+                err_t err = tcp_write(active_pcb, data_payload_ptr, chunk_size, TCP_WRITE_FLAG_COPY);
+                if (err == ERR_OK) {
+                    tcp_output(active_pcb); // Push onto physical link immediately
+                    tx_bytes_offset += chunk_size;
+                }
+            }
+            break;
+        }
+        */
+        /*
+        case SYS_STREAM_TCP: {
+                    // Instead of looping through all 40,960 bytes, let's create a compact
+                    // live-telemetry frame of just 32 evenly spaced samples to send to the GUI.
+                    static uint32_t gui_packet[32];
+
+                    for(int i = 0; i < 32; i++) {
+                        // Stride across the 10,240 hardware buffer elements cleanly
+                        gui_packet[i] = destination_buffer[i * 320];
+                    }
+
+                    int available_tcp_space = tcp_sndbuf(active_pcb);
+                    int packet_size = 32 * 4; // 128 Bytes total
+
+                    if (available_tcp_space >= packet_size) {
+                        err_t err = tcp_write(active_pcb, gui_packet, packet_size, TCP_WRITE_FLAG_COPY);
+                        if (err == ERR_OK) {
+                            tcp_output(active_pcb);
+                            // Cycle straight back to gather a completely fresh hardware buffer allocation
+                            current_state = SYS_START_DMA;
+                        }
+                    }
+                    break;
+                }
+
+        case SYS_STREAM_TCP: {
+            // We want to send 32 averaged samples to the GUI to keep it smooth
+            static uint32_t gui_packet[32];
+            int samples_per_avg = 320; // The stride you were using
+
+            for (int i = 0; i < 32; i++) {
+                int32_t ia_sum = 0;
+                int32_t w_sum = 0;
+
+                // Average 320 samples to eliminate the "comb" aliasing effect
+                for (int j = 0; j < samples_per_avg; j++) {
+                    uint32_t raw_word = destination_buffer[(i * samples_per_avg) + j];
+                    ia_sum += (int16_t)(raw_word & 0xFFFF);
+                    w_sum  += (int16_t)((raw_word >> 16) & 0xFFFF);
+                }
+
+                // Compute averages and re-pack into the packet for the GUI
+                int16_t ia_avg = (int16_t)(ia_sum / samples_per_avg);
+                int16_t w_avg  = (int16_t)(w_sum / samples_per_avg);
+
+                gui_packet[i] = ((uint16_t)w_avg << 16) | ((uint16_t)ia_avg & 0xFFFF);
+            }
+
+            // Send the smoothed packet
+            if (tcp_sndbuf(active_pcb) >= (32 * 4)) {
+                tcp_write(active_pcb, gui_packet, (32 * 4), TCP_WRITE_FLAG_COPY);
+                tcp_output(active_pcb);
+                current_state = SYS_START_DMA; // Re-arm for next buffer
+            }
+            break;
+        }
+    }
+
+    return 0;
+}
+*/
+
+
+
+
+int transfer_data() {
+    // If no client is connected to our GUI/PC script, reset state and wait
+    if (active_pcb == NULL) {
+        return 0;
+    }
+
+    static sys_state_t current_state = SYS_IDLE;
+    static int tx_bytes_offset = 0;
+    int status;
+
+    switch (current_state) {
+
+        case SYS_IDLE:
+            tx_bytes_offset = 0;
+            current_state = SYS_START_DMA;
+            break;
+
+        case SYS_START_DMA:
+            tx_bytes_offset = 0;
+
+            // 1. Kick off the Simple DMA Transfer (Non-blocking call)
+            // Removed cache invalidation from here—doing it before the transfer opens a race window.
+            status = XAxiDma_SimpleTransfer(&dma_instance, (UINTPTR)destination_buffer,
+                                            BYTES_TO_TRANSFER, XAXIDMA_DEVICE_TO_DMA);
+            if (status == XST_SUCCESS) {
+                current_state = SYS_WAIT_DMA;
+            }
+            break;
+
+        case SYS_WAIT_DMA:
+            // 2. Poll the hardware registers non-blockingly.
+            if (!XAxiDma_Busy(&dma_instance, XAXIDMA_DEVICE_TO_DMA)) {
+
+                // CRITICAL FIX: Invalidate cache AFTER the hardware finishes writing to DDR.
+                // This forces the ARM CPU to pull the fresh data directly out of physical memory.
+                Xil_DCacheInvalidateRange((UINTPTR)destination_buffer, BYTES_TO_TRANSFER);
+
+                tx_bytes_offset = 0;
+                current_state = SYS_STREAM_TCP;
+            }
+            break;
+            /*
+        case SYS_STREAM_TCP: {
+            int remaining_bytes = BYTES_TO_TRANSFER - tx_bytes_offset;
+
+            // If the entire 40,960-byte block has been streamed, loop back for fresh samples
+            if (remaining_bytes <= 0) {
+                current_state = SYS_START_DMA;
+                break;
+            }
+
+            // 3. Check available room in the lwIP TCP transmit window buffer
+            int available_tcp_space = tcp_sndbuf(active_pcb);
+            int chunk_size = (remaining_bytes < available_tcp_space) ? remaining_bytes : available_tcp_space;
+
+            if (chunk_size > 0) {
+                // Get pointer to current slice of data array
+                uint8_t *data_payload_ptr = (uint8_t *)destination_buffer + tx_bytes_offset;
+
+                // Write the high-resolution binary chunk to the TCP transmission queue
+                err_t err = tcp_write(active_pcb, data_payload_ptr, chunk_size, TCP_WRITE_FLAG_COPY);
+                if (err == ERR_OK) {
+                    tcp_output(active_pcb); // Push onto physical link immediately
+                    tx_bytes_offset += chunk_size;
+                }
+            }
+            */
+
+        case SYS_STREAM_TCP: {
+            int remaining_bytes = BYTES_TO_TRANSFER - tx_bytes_offset;
+
+            // As soon as this specific buffer block is cleared out...
+            if (remaining_bytes <= 0) {
+                // ...instantly flip back to grab the NEXT sequential block from the FPGA wrapper!
+                current_state = SYS_START_DMA;
+                break;
+            }
+
+            int available_tcp_space = tcp_sndbuf(active_pcb);
+            int chunk_size = (remaining_bytes < available_tcp_space) ? remaining_bytes : available_tcp_space;
+
+            if (chunk_size > 0) {
+                uint8_t *data_payload_ptr = (uint8_t *)destination_buffer + tx_bytes_offset;
+
+                err_t err = tcp_write(active_pcb, data_payload_ptr, chunk_size, TCP_WRITE_FLAG_COPY);
+                if (err == ERR_OK) {
+                    tcp_output(active_pcb);
+                    tx_bytes_offset += chunk_size;
+                }
+            }
+            break;
+        }
+    }
+
+    return 0;
+}
+
+int transfer_data_numbers() {
+	if (active_pcb == NULL) {
+	        return 0;
+	    }
+
+	    /* 2. Track our sequence number (1 to 10) */
+	    static int test_counter = 1;
+
+	    /* 3. If we already finished sending 1 to 10, stop completely */
+	    if (test_counter > 10) {
+	        return 0;
+	    }
+
+	    /* 4. Rate Limiting Delay Counter
+	          Prevents the Zynq from firing all 10 numbers instantly. */
+	    static uint32_t delay_loops = 0;
+	    if (delay_loops++ < 10000000) {
+	        return 0; // Keep waiting
+	    }
+	    delay_loops = 0; // Reset delay counter
+
+	    /* 5. Prepare the data packet string */
+	    char tx_buffer[16];
+	    sprintf(tx_buffer, "%d\n", test_counter);
+
+	    /* 6. Send via lwIP */
+	    if (tcp_sndbuf(active_pcb) > strlen(tx_buffer)) {
+	        err_t err = tcp_write(active_pcb, tx_buffer, strlen(tx_buffer), TCP_WRITE_FLAG_COPY);
+
+	        if (err == ERR_OK) {
+	            tcp_output(active_pcb);  // Force immediate packet transmission
+	            xil_printf("Sent test value: %d\r\n", test_counter);
+	            test_counter++;          // Move to next number
+	        }
+	    }
+
+	return 0;
+}
+
+void print_app_header()
+{
+#if (LWIP_IPV6==0)
+	xil_printf("\n\r\n\r-----lwIP TCP echo server ------\n\r");
+#else
+	xil_printf("\n\r\n\r-----lwIPv6 TCP echo server ------\n\r");
+#endif
+	xil_printf("TCP packets sent to port 6001 will be echoed back\n\r");
+}
+
+err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
+                               struct pbuf *p, err_t err)
+{
+	/* do not read the packet if we are not in ESTABLISHED state */
+	if (!p) {
+		active_pcb = NULL;
+		tcp_close(tpcb);
+		tcp_recv(tpcb, NULL);
+		return ERR_OK;
+	}
+
+	/* indicate that the packet has been received */
+	tcp_recved(tpcb, p->len);
+
+	/* echo back the payload */
+	/* in this case, we assume that the payload is < TCP_SND_BUF */
+	if (tcp_sndbuf(tpcb) > p->len) {
+		err = tcp_write(tpcb, p->payload, p->len, 1);
+	} else
+		xil_printf("no space in tcp_sndbuf\n\r");
+
+	/* free the received pbuf */
+	pbuf_free(p);
+
+	return ERR_OK;
+}
+
+err_t accept_callback(void *arg, struct tcp_pcb *newpcb, err_t err)
+{
+	static int connection = 1;
+
+	/* set the receive callback for this connection */
+	tcp_recv(newpcb, recv_callback);
+
+	/* just use an integer number indicating the connection id as the
+	   callback argument */
+	tcp_arg(newpcb, (void*)(UINTPTR)connection);
+
+	/* increment for subsequent accepted connections */
+	connection++;
+
+	active_pcb = newpcb;
+
+	// changed from original
+	tcp_nagle_disable(newpcb);
+
+	return ERR_OK;
+}
+
+
+int start_application()
+{
+	struct tcp_pcb *pcb;
+	err_t err;
+	unsigned port = 7;
+
+	/* create new TCP PCB structure */
+	pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
+	if (!pcb) {
+		xil_printf("Error creating PCB. Out of Memory\n\r");
+		return -1;
+	}
+
+	/* bind to specified @port */
+	err = tcp_bind(pcb, IP_ANY_TYPE, port);
+	if (err != ERR_OK) {
+		xil_printf("Unable to bind to port %d: err = %d\n\r", port, err);
+		return -2;
+	}
+
+	/* we do not need any arguments to callback functions */
+	tcp_arg(pcb, NULL);
+
+	/* listen for connections */
+	pcb = tcp_listen(pcb);
+	if (!pcb) {
+		xil_printf("Out of memory while tcp_listen\n\r");
+		return -3;
+	}
+
+	/* specify callback to use for incoming connections */
+	tcp_accept(pcb, accept_callback);
+
+	xil_printf("TCP echo server started @ port %d\n\r", port);
+
+	return 0;
+}

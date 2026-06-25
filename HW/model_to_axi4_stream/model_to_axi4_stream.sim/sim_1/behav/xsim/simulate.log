@@ -1,0 +1,3 @@
+Time resolution is 1 ps
+Simulation Completed. Verify waveforms for TLAST alignment.
+$finish called at time : 800170 ns : File "C:/Vivadoworkspace/DCM_MODULE_DMA/DCM_MODULE_DMA.srcs/sim_1/new/tb_pmdc_axis_wrapper.v" Line 86
